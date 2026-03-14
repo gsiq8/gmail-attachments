@@ -1,7 +1,11 @@
 import os
+import re
 import base64
 import zipfile
+import requests
 from datetime import datetime
+from email.utils import parsedate_to_datetime
+from urllib.parse import urlparse, unquote
 from google.auth.transport.requests import Request
 from google.oauth2.credentials import Credentials
 from google_auth_oauthlib.flow import InstalledAppFlow
@@ -9,7 +13,7 @@ from googleapiclient.discovery import build
 
 SCOPES = ['https://www.googleapis.com/auth/gmail.readonly']
 TEMP_DIR = './shiphero_temp'
-OUTPUT_ZIP = f'./shiphero_attachments_{datetime.now().strftime("%Y%m%d")}.zip'
+OUTPUT_ZIP = f'./shiphero_attachments_{datetime.now().strftime("%Y_%m_%d")}.zip'
 
 def authenticate():
     creds = None
@@ -25,12 +29,32 @@ def authenticate():
             token.write(creds.to_json())
     return build('gmail', 'v1', credentials=creds)
 
+def extract_download_links(html_body):
+    """Extract CloudFront download URLs from ShipHero email body."""
+    pattern = r'href="(https://[^"]*cloudfront\.net/[^"]*\.csv)"'
+    return re.findall(pattern, html_body)
+
+def get_email_body(message):
+    """Extract the email body (HTML or plain text) from a Gmail message."""
+    payload = message['payload']
+
+    # Single-part message
+    if 'body' in payload and payload['body'].get('data'):
+        return base64.urlsafe_b64decode(payload['body']['data']).decode('utf-8')
+
+    # Multi-part message
+    for part in payload.get('parts', []):
+        if part['mimeType'] in ('text/html', 'text/plain') and part['body'].get('data'):
+            return base64.urlsafe_b64decode(part['body']['data']).decode('utf-8')
+
+    return ''
+
 def download_and_zip(service):
     os.makedirs(TEMP_DIR, exist_ok=True)
     downloaded = []
 
     today = datetime.now().strftime('%Y/%m/%d')
-    query = f'has:attachment from:noreply@shiphero.com after:{today}'
+    query = f'from:noreply@shiphero.com newer_than:1h'
     print(f"Query: {query}")
 
     results = service.users().messages().list(
@@ -52,31 +76,37 @@ def download_and_zip(service):
         headers = {h['name']: h['value'] for h in message['payload']['headers']}
         subject = headers.get('Subject', 'No Subject')
 
-        for part in message['payload'].get('parts', []):
-            filename = part.get('filename')
-            att_id = part.get('body', {}).get('attachmentId')
+        body = get_email_body(message)
+        links = extract_download_links(body)
 
-            if filename and att_id:
-                att = service.users().messages().attachments().get(
-                    userId='me', messageId=msg['id'], id=att_id
-                ).execute()
+        if not links:
+            print(f"  ⚠ No download link found in: '{subject}'")
+            continue
 
-                data = base64.urlsafe_b64decode(att['data'])
-                filepath = os.path.join(TEMP_DIR, filename)
+        for url in links:
+            # Extract filename from URL
+            path = urlparse(url).path
+            filename = unquote(os.path.basename(path))
 
-                # Avoid overwriting duplicates
-                if os.path.exists(filepath):
-                    base, ext = os.path.splitext(filename)
-                    filepath = os.path.join(TEMP_DIR, f"{base}_{msg['id'][:6]}{ext}")
+            filepath = os.path.join(TEMP_DIR, filename)
 
+            # Avoid overwriting duplicates
+            if os.path.exists(filepath):
+                base, ext = os.path.splitext(filename)
+                filepath = os.path.join(TEMP_DIR, f"{base}_{msg['id'][:6]}{ext}")
+
+            # Download the file
+            response = requests.get(url)
+            if response.status_code == 200:
                 with open(filepath, 'wb') as f:
-                    f.write(data)
-
+                    f.write(response.content)
                 downloaded.append(filepath)
                 print(f"  ✓ Downloaded: {filename}  (from: '{subject}')")
+            else:
+                print(f"  ✗ Failed to download {filename}: HTTP {response.status_code}")
 
     if not downloaded:
-        print("No attachments found.")
+        print("No files downloaded.")
         return
 
     # Pack everything into a single zip
