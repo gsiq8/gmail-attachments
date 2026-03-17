@@ -8,3 +8,6 @@ __pycache__/
 # Google OAuth secrets - NEVER commit these
 credentials.json
 token.json
+
+# Environment variables - NEVER commit these
+.env
