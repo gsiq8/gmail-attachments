@@ -4,3 +4,7 @@ shiphero_attachments_20260313/
 fixed_csvs/
 __pycache__/
 *.pyc
+
+# Google OAuth secrets - NEVER commit these
+credentials.json
+token.json
